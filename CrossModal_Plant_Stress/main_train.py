@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from config import *
 from voc_registry import build_knowledge_bank_tensors, get_stress_to_voc_mask, VOC_KNOWLEDGE_BASE
-from data_loader_sensor import load_records_from_zip, GasResponseDataset
+from data_loader_sensor import load_records_from_folder, GasResponseDataset
 from model_fusion import CrossModalNetwork
 
 
@@ -158,7 +158,7 @@ def main():
     voc_mask_true = get_stress_to_voc_mask()
 
     print("Loading sensor data from zip...")
-    records = load_records_from_zip(ZIP_PATH, START_ROW, TARGET_LEN)
+    records = load_records_from_folder(ZIP_PATH, START_ROW, TARGET_LEN)
     print(f"Loaded records: {len(records)}")
 
     if len(records) == 0:
