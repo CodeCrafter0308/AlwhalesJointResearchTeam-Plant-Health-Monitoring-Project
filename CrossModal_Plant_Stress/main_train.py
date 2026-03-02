@@ -23,10 +23,9 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
 
 def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_batch, voc_mask_true):
-    ds_tr = GasResponseDataset(train_recs)  # 如果您加了增强，记得传入 is_train=True
+    ds_tr = GasResponseDataset(train_recs)
     ds_va = GasResponseDataset(val_recs, mean=ds_tr.mean, std=ds_tr.std)
 
-    # 类别平衡采样器，防止 Batch 内标签极度不平衡导致模型抽风
     period_labels = torch.tensor([r["period_idx"] for r in train_recs], dtype=torch.long)
     class_counts = torch.bincount(period_labels, minlength=5)
     class_weights = 1.0 / (class_counts.float() + 1e-6)
@@ -38,21 +37,16 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
 
     model = CrossModalNetwork(d_sensor=D_MODEL, d_mol=MOL_DIM).to(device)
 
-    # === 优化 2：更换优化器参数与预热调度器 (OneCycleLR) ===
-    # 稍微提高 weight_decay (从 1e-3 提高到 1e-2) 防止小样本过拟合
-    MAX_LR = 1e-3  # 如果您原本的 LR 很大，这里建议设为 1e-3 或 5e-4
+    MAX_LR = 1e-3
     opt = torch.optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=1e-2)
 
-    # OneCycleLR 会在初始阶段用极低的学习率进行 Warmup，然后平缓下降
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         opt,
         max_lr=MAX_LR,
         steps_per_epoch=len(dl_tr),
         epochs=EPOCHS,
-        pct_start=0.1  # 前 10% 的时间用于学习率预热
+        pct_start=0.1
     )
-
-    # === 优化 1：定义带 Label Smoothing 的损失函数 ===
 
     best_score = 0
     fold_dir = Path(out_dir) / f"fold_{fold_id}"
@@ -62,7 +56,15 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
     fp_batch = fp_batch.to(device)
     voc_mask_true = voc_mask_true.to(device)
 
-    history = {"epoch": [], "acc_s": [], "acc_p": []}
+    # === 修改 1：扩展 history 字典，记录更多指标 ===
+    history = {
+        "epoch": [],
+        "lr": [],
+        "acc_stress": [],
+        "acc_period": [],
+        "acc_joint": [],
+        "best_score": []
+    }
 
     for ep in range(1, EPOCHS + 1):
         model.train()
@@ -71,8 +73,6 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
             opt.zero_grad()
             out = model(x, g_batch, fp_batch)
 
-            # ✅ 核心修复：直接调用模型内置的级联损失函数
-            # 这样才能把分类、回归、以及化学词汇的正则化惩罚项统一激活
             loss = model.loss(out, y_s, y_p, voc_mask_true)
 
             loss.backward()
@@ -104,11 +104,7 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
         acc_s = (ys_all == ps_all).float().mean().item()
         acc_p = (yp_all == pp_all).float().mean().item()
         acc_joint = ((ys_all == ps_all) & (yp_all == pp_all)).float().mean().item()
-
-        history["epoch"].append(ep)
-        history["acc_s"].append(acc_s)
-        history["acc_p"].append(acc_p)
-
+        current_lr = opt.param_groups[0]['lr']
         score = 0.5 * acc_s + 0.5 * acc_p
 
         if score > best_score:
@@ -120,10 +116,23 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
             attn_df["True_Period"] = yp_all.numpy()
             attn_df.to_csv(fold_dir / "voc_attention_analysis.csv", index=False)
 
-        current_lr = opt.param_groups[0]['lr']
+        # === 修改 2：将当前 epoch 的指标存入 history ===
+        history["epoch"].append(ep)
+        history["lr"].append(current_lr)
+        history["acc_stress"].append(acc_s)
+        history["acc_period"].append(acc_p)
+        history["acc_joint"].append(acc_joint)
+        history["best_score"].append(best_score)
+
         print(f"[Fold {fold_id}] Epoch {ep:03d} | LR: {current_lr:.2e} | "
               f"Stress: {acc_s:.4f} | Period: {acc_p:.4f} | Joint: {acc_joint:.4f} | "
               f"Best: {best_score:.4f}")
+
+    # === 修改 3：在每一折训练结束后，将 history 转换为 DataFrame 并导出为 CSV ===
+    history_df = pd.DataFrame(history)
+    csv_save_path = fold_dir / f"fold_{fold_id}_metrics_history.csv"
+    history_df.to_csv(csv_save_path, index=False)
+    print(f"✅ Fold {fold_id} 的训练指标已成功导出至: {csv_save_path}")
 
     return history
 
@@ -133,7 +142,8 @@ def plot_cv5_curves(all_histories, out_dir):
 
     plt.subplot(1, 2, 1)
     for fold in range(5):
-        plt.plot(all_histories[fold]["epoch"], all_histories[fold]["acc_s"],
+        # 将这里的 "acc_s" 替换为 "acc_stress"
+        plt.plot(all_histories[fold]["epoch"], all_histories[fold]["acc_stress"],
                  label=f"Fold {fold}", linewidth=2, alpha=0.9)
     plt.title("Validation Stress Accuracy (5-Fold CV)", fontsize=14)
     plt.xlabel("Epoch", fontsize=12)
@@ -143,7 +153,8 @@ def plot_cv5_curves(all_histories, out_dir):
 
     plt.subplot(1, 2, 2)
     for fold in range(5):
-        plt.plot(all_histories[fold]["epoch"], all_histories[fold]["acc_p"],
+        # 将这里的 "acc_p" 替换为 "acc_period"
+        plt.plot(all_histories[fold]["epoch"], all_histories[fold]["acc_period"],
                  label=f"Fold {fold}", linewidth=2, alpha=0.9)
     plt.title("Validation Period Accuracy (5-Fold CV)", fontsize=14)
     plt.xlabel("Epoch", fontsize=12)
@@ -155,7 +166,7 @@ def plot_cv5_curves(all_histories, out_dir):
     save_path = out_dir / "cv5_accuracy_curves_fundamental_BS=64_MAX_LR=5e-4_TL=128.png"
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"\n✅ 基于底层优化后的5折精度曲线图已保存至: {save_path}")
+    print(f"\n✅ 5折精度曲线图已保存至: {save_path}")
 
 
 def main():
