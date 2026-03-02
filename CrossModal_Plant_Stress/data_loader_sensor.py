@@ -1,4 +1,4 @@
-import os
+import io
 import re
 import csv
 import zipfile
@@ -14,9 +14,9 @@ def parse_name(path_in_zip):
     m = re.match(r"([A-Za-z]+)_(\d+)h_(\d+)\.csv$", base)
     if not m: return None
     kind, hour, file_fold = m.group(1).lower(), int(m.group(2)), int(m.group(3))
-    if "salt" in kind:
+    if "drought" in kind:
         stress = 0
-    elif "drought" in kind:
+    elif "salt" in kind:
         stress = 1
     elif "heat" in kind:
         stress = 2
@@ -24,49 +24,29 @@ def parse_name(path_in_zip):
         return None
     return base, hour, file_fold, stress
 
-def load_records_from_folder(folder_path, start_row, target_len):
+
+def load_records_from_zip(zip_path, start_row, target_len):
     records = []
-
-    # 使用 os.walk 遍历文件夹及其子文件夹中的所有文件
-    for root, dirs, files in os.walk(folder_path):
-        for file in files:
-            # 筛选出 CSV 文件
-            if not file.lower().endswith(".csv"):
-                continue
-
-            # 获取文件的完整路径
-            file_path = os.path.join(root, file)
-
-            # 假设 parse_name 只需要文件名即可解析
-            meta = parse_name(file)
-            if not meta:
-                continue
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for name in [n for n in zf.namelist() if n.lower().endswith(".csv")]:
+            meta = parse_name(name)
+            if not meta: continue
             base, hour, file_fold, stress = meta
 
-            # 直接从本地路径打开文件，不再需要 io.TextIOWrapper
-            with open(file_path, "r", encoding="utf-8-sig") as fb:
-                reader = csv.reader(fb)
-                try:
-                    header = next(reader)
-                except StopIteration:
-                    continue  # 跳过空文件
-
-                cols = [i for i, c in enumerate(header) if c.startswith("VOCs_Extracted_S")]
-                if len(cols) != 8:
-                    continue
+            with zf.open(name, "r") as fb:
+                reader = csv.reader(io.TextIOWrapper(fb, encoding="utf-8-sig"))
+                header = next(reader)
+                cols = [i for i, c in enumerate(header) if c.startswith("Chan")]
+                if len(cols) != 8: continue
 
                 rows = []
                 for ridx, row in enumerate(reader):
-                    if ridx < start_row - 1:
-                        continue
-                    # 提取对应列的数据，处理空值情况
-                    rows.append([float(row[j]) if j < len(row) and row[j] else np.nan for j in cols])
+                    if ridx < start_row - 1: continue
+                    rows.append([float(row[j]) if row[j] else np.nan for j in cols])
 
-            if len(rows) < 20:
-                continue
-
-            # 数据预处理：插值与分割
+            if len(rows) < 20: continue
             X = np.asarray(rows, dtype=np.float32).T
+
             for ch in range(8):
                 m = np.isfinite(X[ch])
                 if m.sum() > 0 and m.sum() < X.shape[1]:
@@ -74,18 +54,36 @@ def load_records_from_folder(folder_path, start_row, target_len):
                 elif m.sum() == 0:
                     X[ch] = 0
 
+            # 将总数据按时间维度（axis=1）均分为 5 个气敏响应过程
             seg_len = X.shape[1] // 5
             for seg_id, seg in enumerate(np.split(X[:, :seg_len * 5], 5, axis=1)):
-                arr = np.vstack(
-                    [np.interp(np.linspace(0, 1, target_len), np.linspace(0, 1, seg_len), seg[ch]) for ch in range(8)]
-                )
-                records.append({
-                    "x": arr.astype(np.float32),
-                    "stress": stress,
-                    "period_idx": PERIOD_TO_INDEX[hour],
-                    "cv_fold": random.randint(0, 4)
-                })
 
+                # 将总数据按时间维度（axis=1）均分为 5 个气敏响应过程
+                seg_len = X.shape[1] // 5
+                for seg_id, seg in enumerate(np.split(X[:, :seg_len * 5], 5, axis=1)):
+
+                    # 提取出每个响应过程的第 400~1000 行
+                    sub_seg = seg[:, 400:1000]
+                    sub_seg_len = sub_seg.shape[1]
+
+                    if sub_seg_len < 2:
+                        continue
+
+                    # ================= 新增：物理基线校准 (Baseline Correction) =================
+                    # 取切片的前 10 个点作为该响应周期的基线 R0
+                    R0 = sub_seg[:, 0:10].mean(axis=1, keepdims=True)
+                    # 计算相对响应变化率: (R - R0) / R0，加上 1e-6 防止除零
+                    sub_seg = (sub_seg - R0) / (np.abs(R0) + 1e-6)
+                    # =====================================================================
+
+                    # 将提取出的数据插值对齐到设定的 target_len
+                    arr = np.vstack(
+                        [np.interp(np.linspace(0, 1, target_len), np.linspace(0, 1, sub_seg_len), sub_seg[ch]) for ch in
+                         range(8)]
+                    )
+
+                    records.append({"x": arr.astype(np.float32), "stress": stress, "period_idx": PERIOD_TO_INDEX[hour],
+                                    "cv_fold": random.randint(0, 4)})
     return records
 
 

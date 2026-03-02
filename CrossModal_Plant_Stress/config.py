@@ -1,15 +1,15 @@
 import os
 
 # ================= 数据路径 =================
-ZIP_PATH = r"C:\Users\niwangze\Desktop\Plant_health_monitoring_project\Model\Gas mixture_Dataset"
-OUT_DIR = r"C:\Users\niwangze\Desktop\Plant_health_monitoring_project\Model\CrossModal_Output"
+ZIP_PATH = "C:/Users/niwangze/Desktop/Plant_health_monitoring_project/Model/Gas mixture_Dataset.zip"
+OUT_DIR = "C:/Users/niwangze/Desktop/Plant_health_monitoring_project/Model/CrossModal_Output"
 
 # ================= 训练超参数 =================
 START_ROW = 0
-TARGET_LEN = 96
-EPOCHS = 500
-BATCH_SIZE = 32
-LR = 1.5e-3
+TARGET_LEN = 256
+EPOCHS = 250
+BATCH_SIZE = 64
+LR = 5e-4
 SEED = 42
 
 # ================= 模型维度配置 =================

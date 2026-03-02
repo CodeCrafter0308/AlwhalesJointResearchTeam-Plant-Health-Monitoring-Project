@@ -3,13 +3,14 @@ import random
 import torch
 import numpy as np
 import pandas as pd
+import torch.nn as nn
 import matplotlib.pyplot as plt
 from pathlib import Path
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from config import *
 from voc_registry import build_knowledge_bank_tensors, get_stress_to_voc_mask, VOC_KNOWLEDGE_BASE
-from data_loader_sensor import load_records_from_folder, GasResponseDataset
+from data_loader_sensor import load_records_from_zip, GasResponseDataset
 from model_fusion import CrossModalNetwork
 
 
@@ -21,9 +22,8 @@ def set_seed(seed=42):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 
-
 def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_batch, voc_mask_true):
-    ds_tr = GasResponseDataset(train_recs)
+    ds_tr = GasResponseDataset(train_recs)  # 如果您加了增强，记得传入 is_train=True
     ds_va = GasResponseDataset(val_recs, mean=ds_tr.mean, std=ds_tr.std)
 
     # 类别平衡采样器，防止 Batch 内标签极度不平衡导致模型抽风
@@ -37,10 +37,22 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
     dl_va = DataLoader(ds_va, batch_size=BATCH_SIZE, shuffle=False)
 
     model = CrossModalNetwork(d_sensor=D_MODEL, d_mol=MOL_DIM).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
 
-    # 余弦退火学习率调度器，后期平稳收敛
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS, eta_min=1e-5)
+    # === 优化 2：更换优化器参数与预热调度器 (OneCycleLR) ===
+    # 稍微提高 weight_decay (从 1e-3 提高到 1e-2) 防止小样本过拟合
+    MAX_LR = 1e-3  # 如果您原本的 LR 很大，这里建议设为 1e-3 或 5e-4
+    opt = torch.optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=1e-2)
+
+    # OneCycleLR 会在初始阶段用极低的学习率进行 Warmup，然后平缓下降
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        opt,
+        max_lr=MAX_LR,
+        steps_per_epoch=len(dl_tr),
+        epochs=EPOCHS,
+        pct_start=0.1  # 前 10% 的时间用于学习率预热
+    )
+
+    # === 优化 1：定义带 Label Smoothing 的损失函数 ===
 
     best_score = 0
     fold_dir = Path(out_dir) / f"fold_{fold_id}"
@@ -58,14 +70,15 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
             x, y_s, y_p = x.to(device), y_s.to(device), y_p.to(device)
             opt.zero_grad()
             out = model(x, g_batch, fp_batch)
-            loss = model.loss(out, y_s, y_p, voc_mask_true)
-            loss.backward()
 
-            # 梯度裁剪
+            # ✅ 核心修复：直接调用模型内置的级联损失函数
+            # 这样才能把分类、回归、以及化学词汇的正则化惩罚项统一激活
+            loss = model.loss(out, y_s, y_p, voc_mask_true)
+
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
-
-        scheduler.step()
+            scheduler.step()
 
         model.eval()
         ys_all, ps_all, yp_all, pp_all, attn_all = [], [], [], [], []
@@ -78,7 +91,6 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
                 ps_all.append(out["logits_stress"].argmax(dim=1).cpu())
 
                 yp_all.append(y_p.cpu())
-                # 【关键修复点】：这里使用 logits_period_cls
                 pp_all.append(out["logits_period_cls"].argmax(dim=1).cpu())
 
                 attn_all.append(out["attn_voc"].cpu())
@@ -140,7 +152,7 @@ def plot_cv5_curves(all_histories, out_dir):
     plt.legend(loc='lower right')
 
     plt.tight_layout()
-    save_path = out_dir / "cv5_accuracy_curves_fundamental.png"
+    save_path = out_dir / "cv5_accuracy_curves_fundamental_BS=64_MAX_LR=5e-4_TL=128.png"
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"\n✅ 基于底层优化后的5折精度曲线图已保存至: {save_path}")
@@ -158,7 +170,7 @@ def main():
     voc_mask_true = get_stress_to_voc_mask()
 
     print("Loading sensor data from zip...")
-    records = load_records_from_folder(ZIP_PATH, START_ROW, TARGET_LEN)
+    records = load_records_from_zip(ZIP_PATH, START_ROW, TARGET_LEN)
     print(f"Loaded records: {len(records)}")
 
     if len(records) == 0:
