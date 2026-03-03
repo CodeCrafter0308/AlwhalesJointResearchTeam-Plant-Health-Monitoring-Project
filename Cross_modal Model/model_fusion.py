@@ -4,16 +4,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model_sensor import SensorEncoder
 from model_molecule import MoleculeEncoder
+from model_dft import DFTEncoder
 
 
 class CrossModalNetwork(nn.Module):
-    def __init__(self, d_sensor=48, d_mol=128):
+    def __init__(self, d_sensor=48, d_mol=128, d_dft=6):
         super().__init__()
         # 为了兼容之前的修改，这里确保 in_channels=8
         self.sensor_net = SensorEncoder(d=d_sensor, in_channels=8)
         self.mol_net = MoleculeEncoder(hidden_d=d_mol)
+        self.dft_net = DFTEncoder(d_dft=d_dft, d_sensor=d_sensor)
 
         self.mol_proj = nn.Linear(d_mol, d_sensor)
+        # 将 [mol_token, dft_token] 融合为统一的 VOC token
+        self.voc_token_fuse = nn.Sequential(
+            nn.Linear(d_sensor * 2, d_sensor),
+            nn.LayerNorm(d_sensor),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
         self.cross_attn = nn.MultiheadAttention(embed_dim=d_sensor, num_heads=4, batch_first=True)
 
         feature_dim = d_sensor * 2
@@ -57,16 +66,25 @@ class CrossModalNetwork(nn.Module):
             nn.Linear(d_sensor, 1)
         )
 
-    def forward(self, x_sensor, g_batch, fp_batch):
+    def forward(self, x_sensor, g_batch, fp_batch, dft_feat_bank=None):
         # 1. 提取基础传感器特征
         h_shared = self.sensor_net(x_sensor)  # Shape: (B, d_sensor)
 
         # 2. 跨模态化学知识融合 (专供 Stress 分支使用)
         z_mol = self.mol_net(g_batch, fp_batch)
-        z_mol = self.mol_proj(z_mol)
+        z_mol = self.mol_proj(z_mol)  # [N_voc, d_sensor]
+
+        # 2.1 DFT 特征编码 (第三分支)。dft_feat_bank: [N_voc, D_dft]
+        if dft_feat_bank is None:
+            d_dft = self.dft_net.net[0].in_features
+            dft_feat_bank = torch.zeros((z_mol.size(0), d_dft), device=z_mol.device, dtype=z_mol.dtype)
+        z_dft = self.dft_net(dft_feat_bank.to(device=z_mol.device, dtype=z_mol.dtype))  # [N_voc, d_sensor]
+
+        # 2.2 将分子指纹 token 与 DFT token 融合为 VOC token
+        z_voc = self.voc_token_fuse(torch.cat([z_mol, z_dft], dim=-1))  # [N_voc, d_sensor]
 
         h_query = h_shared.unsqueeze(1)
-        z_kv = z_mol.unsqueeze(0).repeat(h_query.size(0), 1, 1)
+        z_kv = z_voc.unsqueeze(0).repeat(h_query.size(0), 1, 1)
 
         c_stress, attn_w = self.cross_attn(query=h_query, key=z_kv, value=z_kv)
 

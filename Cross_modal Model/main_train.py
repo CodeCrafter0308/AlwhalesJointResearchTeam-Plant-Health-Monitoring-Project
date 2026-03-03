@@ -12,6 +12,7 @@ from config import *
 from voc_registry import build_knowledge_bank_tensors, get_stress_to_voc_mask, VOC_KNOWLEDGE_BASE
 from data_loader_sensor import load_records_from_zip, GasResponseDataset
 from model_fusion import CrossModalNetwork
+from dft_bank import build_dft_feature_bank
 
 
 def set_seed(seed=42):
@@ -35,7 +36,10 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
     dl_tr = DataLoader(ds_tr, batch_size=BATCH_SIZE, sampler=sampler)
     dl_va = DataLoader(ds_va, batch_size=BATCH_SIZE, shuffle=False)
 
-    model = CrossModalNetwork(d_sensor=D_MODEL, d_mol=MOL_DIM).to(device)
+    # ===== DFT 第三分支: 吸附能特征银行 (与 VOC_KNOWLEDGE_BASE 的 id 顺序一致) =====
+    dft_feat_bank = build_dft_feature_bank(band_dir=DFT_BAND_DIR, dos_dir=DFT_DOS_DIR, device=device, dtype=torch.float32)
+
+    model = CrossModalNetwork(d_sensor=D_MODEL, d_mol=MOL_DIM, d_dft=int(dft_feat_bank.shape[1])).to(device)
 
     MAX_LR = 1e-3
     opt = torch.optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=1e-2)
@@ -71,7 +75,7 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
         for x, y_s, y_p in dl_tr:
             x, y_s, y_p = x.to(device), y_s.to(device), y_p.to(device)
             opt.zero_grad()
-            out = model(x, g_batch, fp_batch)
+            out = model(x, g_batch, fp_batch, dft_feat_bank)
 
             loss = model.loss(out, y_s, y_p, voc_mask_true)
 
@@ -85,7 +89,7 @@ def train_one_fold(fold_id, train_recs, val_recs, out_dir, device, g_batch, fp_b
         with torch.no_grad():
             for x, y_s, y_p in dl_va:
                 x = x.to(device)
-                out = model(x, g_batch, fp_batch)
+                out = model(x, g_batch, fp_batch, dft_feat_bank)
 
                 ys_all.append(y_s.cpu())
                 ps_all.append(out["logits_stress"].argmax(dim=1).cpu())
